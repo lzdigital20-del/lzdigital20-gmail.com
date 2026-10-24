@@ -29,7 +29,39 @@
 .fine{margin-top:16px;color:var(--muted);font-size:13px}
 @media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:950px){.links{display:none;position:absolute;top:75px;left:4%;right:4%;padding:10px;background:rgba(5,8,13,.98);border:1px solid var(--line);border-radius:13px;flex-direction:column}.links.open{display:flex}.menu{display:block}.hero-grid,.grid2,.grid3,.grid4,.feature,.rows{grid-template-columns:1fr}.hero{min-height:auto}.head{align-items:start;flex-direction:column}.clock{text-align:left}}@media(max-width:560px){.metric{grid-template-columns:1fr}.cols2{grid-template-columns:1fr}}
-@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.page.active{animation:none}}
+/* ---- Animations ---- */
+@keyframes rise{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:none}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+@keyframes shine{to{background-position:200% center}}
+@keyframes barshine{to{background-position:200% 0}}
+@keyframes drift{0%,100%{transform:rotate(-7deg) translate(0,0)}50%{transform:rotate(-5deg) translate(2%,3%)}}
+@keyframes sweep{0%,55%{left:-60%}100%{left:140%}}
+@keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(245,218,145,.55)}50%{transform:scale(1.06);box-shadow:0 0 0 7px rgba(245,218,145,0)}}
+@keyframes glow{0%,100%{box-shadow:0 20px 55px rgba(0,0,0,.26),0 0 0 rgba(226,187,95,0)}50%{box-shadow:0 20px 55px rgba(0,0,0,.26),0 0 40px rgba(226,187,95,.28)}}
+@keyframes ring{0%{box-shadow:0 0 0 0 rgba(88,216,255,.55)}70%,100%{box-shadow:0 0 0 16px rgba(88,216,255,0)}}
+@keyframes tickpop{0%,100%{color:#f0d68e}50%{color:#fff}}
+.offer-bar{background:linear-gradient(90deg,#c99a37,#f5da91,#c99a37,#f5da91,#c99a37);background-size:200% 100%;animation:barshine 9s linear infinite}
+.hero:before{animation:drift 16s ease-in-out infinite}
+.hero h1 span{background-image:linear-gradient(95deg,#fff,#e3bd65,#5ed5ff,#e3bd65,#fff);background-size:200% auto;animation:shine 7s linear infinite}
+.hero-grid>div:first-child>*{animation:rise .8s cubic-bezier(.2,.7,.2,1) both}
+.hero-grid>div:first-child>:nth-child(2){animation-delay:.12s}.hero-grid>div:first-child>:nth-child(3){animation-delay:.24s}.hero-grid>div:first-child>:nth-child(4){animation-delay:.36s}
+.hero-card{animation:rise .9s .3s cubic-bezier(.2,.7,.2,1) both,floaty 6s 1.3s ease-in-out infinite}
+.metric div{transition:border-color .25s,transform .25s}.metric div:hover{border-color:rgba(226,187,95,.5);transform:translateY(-3px)}
+.btn.gold,.btn.blue{position:relative;overflow:hidden}
+.btn.gold:after{content:"";position:absolute;top:0;left:-60%;width:35%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.6),transparent);transform:skewX(-20deg);animation:sweep 3.6s ease-in-out infinite;pointer-events:none}
+.btn{transition:transform .2s,box-shadow .25s}.btn.gold:hover{box-shadow:0 10px 30px rgba(226,187,95,.35)}.btn.blue:hover{box-shadow:0 10px 30px rgba(35,140,255,.4)}
+.card{transition:transform .28s,border-color .28s,box-shadow .28s}
+.pk:hover,.grid3>.card:hover,.grid2>.card:hover:not(:has(form)){transform:translateY(-6px);border-color:rgba(226,187,95,.4);box-shadow:0 26px 60px rgba(0,0,0,.4)}
+.icon{transition:transform .35s}.card:hover .icon{transform:rotate(-8deg) scale(1.12)}
+.off{animation:pulse 2.6s ease-in-out infinite}
+.feature{animation:glow 4.5s ease-in-out infinite}
+.clock b{animation:tickpop 2s ease-in-out infinite}
+.row{transition:background .2s,padding .2s}.row:hover{background:rgba(226,187,95,.06);padding-left:8px;padding-right:8px}
+.faq details{transition:border-color .25s,background .25s}.faq details[open],.faq details:hover{border-color:rgba(226,187,95,.35);background:rgba(226,187,95,.04)}
+.faq details[open] p{animation:rise .35s both}
+.float a{transition:transform .25s}.float a:hover{transform:translateY(-4px) scale(1.08)}.float a:first-child{animation:ring 2.8s ease-out infinite}
+.rv{opacity:0;transform:translateY(24px);transition:opacity .65s ease var(--d,0ms),transform .65s cubic-bezier(.2,.7,.2,1) var(--d,0ms)}.rv.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}.rv{opacity:1!important;transform:none!important}}
 </style></head><body>
 <div class="offer-bar"><a href="#pricing" data-page="pricing">🎉 Grand Opening: special discount on all packages &amp; services until Oct 31, 2026. <u>See pricing</u></a></div>
 <header><div class="container nav"><a class="brand" href="#home" data-page="home"><img src="logo.jpg" alt="Official LZ Digital logo" onerror="this.style.display='none'"><div><b>LZ DIGITAL</b><small>Helping businesses grow</small></div></a><button class="menu" id="menu">☰</button><nav class="links" id="links"><a href="#home" data-page="home">Home</a><a href="#services" data-page="services">Services</a><a href="#pricing" data-page="pricing">Pricing</a><a href="#work" data-page="work">Our Work</a><a href="#process" data-page="process">Process</a><a href="#about" data-page="about">About</a><a href="#faq" data-page="faq">FAQ</a><a href="#contact" data-page="contact">Contact</a><a href="#start" data-page="start" style="color:#f0d68e">Start a Project</a></nav></div></header>
@@ -101,6 +133,8 @@
 <div class="float"><a href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener" title="Telegram">✈</a><a href="mailto:lzdigital20@gmail.com" title="Email">✉</a><a href="tel:+251957134860" title="Primary phone">☎</a></div>
 <script>
 const pages=[...document.querySelectorAll('.page')],links=[...document.querySelectorAll('[data-page]')],nav=document.getElementById('links'),hero=document.getElementById('hero');function show(n,push=true){const t=document.getElementById(n)?n:'home';pages.forEach(x=>x.classList.toggle('active',x.id===t));links.forEach(x=>x.classList.toggle('active',x.dataset.page===t));hero.style.display=t==='home'?'grid':'none';nav.classList.remove('open');window.scrollTo({top:0,behavior:'smooth'});if(push&&location.hash!=='#'+t)history.pushState(null,'','#'+t)}links.forEach(a=>a.addEventListener('click',e=>{e.preventDefault();show(a.dataset.page)}));document.getElementById('menu').onclick=()=>nav.classList.toggle('open');window.addEventListener('load',()=>show(location.hash.slice(1)||'home',false));window.addEventListener('popstate',()=>show(location.hash.slice(1)||'home',false));document.getElementById('year').textContent=new Date().getFullYear();
+/* Scroll-reveal: cards fade and rise as they enter the screen */
+(function(){if(!('IntersectionObserver' in window)||matchMedia('(prefers-reduced-motion:reduce)').matches)return;const io=new IntersectionObserver(es=>es.forEach(en=>{if(!en.isIntersecting)return;const el=en.target;io.unobserve(el);requestAnimationFrame(()=>el.classList.add('in'));setTimeout(()=>el.classList.remove('rv','in'),1400)}),{threshold:.1});document.querySelectorAll('.card,.sub,.subp,.row,.faq details,.head').forEach(el=>{const i=[...el.parentElement.children].indexOf(el);el.style.setProperty('--d',Math.min(i,6)*90+'ms');el.classList.add('rv');io.observe(el)})})();
 /* Grand Opening offer: ends end of day Oct 31, 2026 (Ethiopia time). After that, regular prices show automatically. */
 const OFFER_END=new Date('2026-10-31T23:59:59+03:00');function tick(){const ms=OFFER_END-Date.now(),on=ms>0;document.body.classList.toggle('offer-off',!on);document.querySelectorAll('.now[data-was]').forEach(e=>{e.textContent=on?e.dataset.now:e.dataset.was});const c=document.getElementById('cd');if(c&&on){const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);c.textContent=d+'d '+h+'h '+m+'m'}}tick();setInterval(tick,30000);
 function mail(subject,body){var mailtoUrl='mailto:lzdigital20@gmail.com?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);var gmailUrl='https://mail.google.com/mail/?view=cm&fs=1&to=lzdigital20@gmail.com&su='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);var isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);if(isMobile){location.href=mailtoUrl}else{window.open(gmailUrl,'_blank','noopener')}return{mailtoUrl:mailtoUrl,gmailUrl:gmailUrl,isMobile:isMobile}}document.getElementById('contactForm').addEventListener('submit',e=>{e.preventDefault();const r=mail('LZ Digital Inquiry',`Name: ${cName.value}
