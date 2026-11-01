@@ -1,697 +1,154 @@
-import asyncio
-import logging
-import os
-from datetime import datetime, timedelta, timezone
-from aiohttp import web
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
-)
-from telegram.error import TelegramError
-
-# Enable logging
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
-
-# ==================== CONFIGURATION ====================
-# Tip: on Render, set BOT_TOKEN under Environment so the token is not stored in this file.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9229429469:AAHwSFqsLjvMWvsHkkOLLRx5a60DpVvo0rA")
-ADMIN_CHAT_ID = 8464557569                                    # Your Admin Telegram ID
-CHANNEL_USERNAME = "@LZDigitalAgency"                         # Your Telegram Channel
-PORT = int(os.environ.get("PORT", 8080))                     # Port for Render Web Service health check
-
-# Grand Opening offer: ends at the end of this day (Ethiopia time, UTC+3).
-# After this moment the bot automatically shows regular prices.
-OFFER_END = datetime(2026, 11, 15, 23, 59, 59, tzinfo=timezone(timedelta(hours=3)))
-
-# In-memory storage for simple statistics/logs
-lead_logs = []
-
-# Conversation states
-SELECTING_CATEGORY, SELECTING_PACKAGE, ENTERING_NAME, ENTERING_PHONE, ENTERING_NOTES = range(5)
-
-# ==================== PRICES (edit prices here) ====================
-# key: (Grand Opening price, regular price, discount %)
-# Use None as regular price when it is not set -> bot shows "Contact us for price" after the offer ends.
-PRICES = {
-    "web_basic":      ("7,200 ETB", "8,000 ETB", 10),
-    "web_business":   ("13,500 ETB", "15,000 ETB", 10),
-    "web_premium":    ("22,000 ETB", "25,000 ETB", 12),
-    "web_luxury":     ("36,000 - 49,500 ETB", "40,000 - 55,000 ETB", 10),
-    "bot_basic":      ("5,000 ETB", "5,500 ETB", 10),
-    "bot_business":   ("10,000 - 18,000 ETB", "11,000 - 20,000 ETB", 10),
-    "bot_advanced":   ("25,000+ ETB", "27,500+ ETB", 10),
-    "bundle_starter": ("5,500 ETB", None, 10),
-    "bundle_growth":  ("19,000 ETB", None, 10),
-    "bundle_pro":     ("38,000 ETB", None, 10),
-    "bundle_transf":  ("54,000 ETB", "60,000 ETB", 10),
-}
-
-
-def offer_on():
-    return datetime.now(timezone.utc) <= OFFER_END
-
-
-def short(key):
-    """Price for button labels."""
-    now, regular, _ = PRICES[key]
-    return now if offer_on() else (regular or "Contact us")
-
-
-def fmt(key, lang="EN"):
-    """Price for message text, with discount details while the offer is running."""
-    now, regular, pct = PRICES[key]
-    if not offer_on():
-        if regular:
-            return f"**{regular}**"
-        return "**Contact us for price**" if lang == "EN" else "**ለዋጋ ያግኙን**"
-    extra = []
-    if regular:
-        extra.append(("was " if lang == "EN" else "ቀድሞ ") + regular)
-    extra.append(f"{pct}% OFF" if lang == "EN" else f"{pct}% ቅናሽ")
-    return f"**{now}** ({', '.join(extra)})"
-
-
-OFFER_BANNER = {
-    "EN": "🎉 **Grand Opening Offer** until November 15, 2026: special discount on all packages & services!",
-    "AM": "🎉 **የታላቁ መክፈቻ ቅናሽ** እስከ ኖቬምበር 15, 2026: በሁሉም ፓኬጆች እና አገልግሎቶች ላይ ልዩ ቅናሽ!",
-}
-
-# ==================== DICTIONARIES & TRANSLATIONS ====================
-TEXTS = {
-    "EN": {
-        "welcome": "👋 **Welcome to LZ DIGITAL!**\n\nPlease select your preferred language / እባክዎ ቋንቋ ይምረጡ:",
-        "main_menu": "👋 **Welcome to LZ DIGITAL!**\nThis bot provides 24/7 digital services for LZ DIGITAL. To check services or get pricing, please use the details below!\n\n🎯 **Main Menu**\nHow can LZ DIGITAL help grow your business today?",
-        "cat_web": "🌐 Website Development",
-        "cat_bot": "🤖 Telegram Bot Development",
-        "cat_bundles": "📦 Business Packages & Bundles",
-        "cat_individual": "🛠 Individual Services",
-        "cat_monthly": "📅 Monthly Content Packages",
-        "cat_social": "🔗 Website & Social Media Links",
-        "cat_custom": "📞 Contact & Custom Quote",
-        "change_lang": "🌐 Change Language / ቋንቋ ቀይር",
-        "back": "⬅️ Back",
-        "main_menu_btn": "🏠 Main Menu",
-        "order_btn": "📝 Request / Order This Service",
-        "prompt_name": "✍️ Please reply with your **Business Name** (or your full name):",
-        "prompt_phone": "📞 Please provide your **Phone Number** so our team can reach you:",
-        "prompt_notes": "💬 Optional: Any additional details, specific requirements, or questions? (Type 'none' to skip)",
-        "success_msg": "✅ **Thank you!** Your request has been received by the LZ DIGITAL team.\nWe will contact you shortly!\n\n📱 Direct Phone: +251 957 134 860 | +251 948 696 673\n📩 Email: lzdigital20@gmail.com",
-    },
-    "AM": {
-        "welcome": "👋 **እንኳን ወደ LZ DIGITAL በሰላም መጡ!**\n\nእባክዎ ቋንቋ ይምረጡ / Please select your preferred language:",
-        "main_menu": "👋 **እንኳን ወደ LZ DIGITAL በሰላም መጡ!**\nይህ ቦት ለ LZ DIGITAL የ24/7 ዲጂታል አገልግሎት ይሰጣል። አገልግሎቶችን ለመፈተሽ ወይም ዋጋ ለማግኘት ከታች ያሉትን ዝርዝሮች ይጠቀሙ!\n\n🎯 **ዋና ማውጫ**\nLZ DIGITAL ዛሬ ቢዝነስዎን እንዴት ሊያሳድግልዎ ይችላል?",
-        "cat_web": "🌐 የዌብሳይት ልማት (Website Dev)",
-        "cat_bot": "🤖 የቴሌግራም ቦት ልማት (Telegram Bot)",
-        "cat_bundles": "📦 ሙሉ የቢዝነስ ፓኬጆች (Bundles)",
-        "cat_individual": "🛠 ነጠላ አገልግሎቶች (Individual Services)",
-        "cat_monthly": "📅 የሶሻል ሚዲያ ወርሃዊ ፓኬጆች",
-        "cat_social": "🔗 ዌብሳይት እና ማህበራዊ ሚዲያ ሊንኮች",
-        "cat_custom": "📞 ማብራሪያ እና ልዩ ጥያቄ",
-        "change_lang": "🌐 ቋንቋ ቀይር / Change Language",
-        "back": "⬅️ ተመለስ",
-        "main_menu_btn": "🏠 ዋና ማውጫ",
-        "order_btn": "📝 ይህንን አገልግሎት እፈልጋለሁ / አዝዝ",
-        "prompt_name": "✍️ እባክዎ የ**ድርጅትዎን ስም** (ወይም የራስዎን ሙሉ ስም) ይጻፉልን:",
-        "prompt_phone": "📞 እባክዎ የ**ስልክ ቁጥርዎን** ያስገቡልን:",
-        "prompt_notes": "💬 ተጨማሪ አስተያየት ወይም የሚፈልጉት ልዩ ነገር ካለ ይጻፉልን (ከሌለ 'የለም' ይበሉ):",
-        "success_msg": "✅ **እናመሰግናለን!** ጥያቄዎ ለ LZ DIGITAL ቡድን ደርሷል።\nበቅርቡ ደውለን እናናግርዎታለን!\n\n📱 ቀጥታ ስልክ: +251 957 134 860 | +251 948 696 673\n📩 ኢሜይል: lzdigital20@gmail.com",
-    }
-}
-
-
-def main_menu_text(lang):
-    text = TEXTS[lang]["main_menu"]
-    if offer_on():
-        text += "\n\n" + OFFER_BANNER[lang]
-    return text
-
-
-def get_catalog():
-    """Built on every call so prices switch automatically when the offer ends."""
-    return {
-        "web": {
-            "title": {"EN": "🌐 **Website Development Packages**", "AM": "🌐 **የዌብሳይት ልማት ፓኬጆች**"},
-            "desc": {
-                "EN": (
-                    f"• **Basic** – {fmt('web_basic')}: 1-3 pages, business info, services, phone number, social links.\n"
-                    f"• **Business** – {fmt('web_business')}: 4-6 pages, better design, gallery, Google Maps, contact form.\n"
-                    f"• **Premium** – {fmt('web_premium')}: 6-10 pages, custom design, portfolio, booking/inquiry forms, basic SEO.\n"
-                    f"• **Luxury** – {fmt('web_luxury')}: premium design, advanced layouts, appointment booking, Telegram bot integration, advanced features."
-                ),
-                "AM": (
-                    f"• **Basic** – {fmt('web_basic', 'AM')}: 1-3 ገፆች፣ የቢዝነስ መረጃ፣ አገልግሎቶች፣ ስልክ ቁጥር፣ የማህበራዊ ሚዲያ ሊንኮች።\n"
-                    f"• **Business** – {fmt('web_business', 'AM')}: 4-6 ገፆች፣ የተሻለ ዲዛይን፣ የፎቶ ጋለሪ፣ ጉግል ማፕ፣ ኮንታክት ፎርም።\n"
-                    f"• **Premium** – {fmt('web_premium', 'AM')}: 6-10 ገፆች፣ ካስተም ዲዛይን፣ ፖርትፎሊዮ፣ የመመዝገቢያ ፎርም፣ SEO።\n"
-                    f"• **Luxury** – {fmt('web_luxury', 'AM')}: ልዩ ዲዛይን፣ የቀጠሮ ማስያዣ፣ የቴሌግራም ቦት እና ልዩ ማሻሻያዎች።"
-                ),
-            },
-            "items": [
-                (f"Basic Website ({short('web_basic')})", "Web Basic"),
-                (f"Business Website ({short('web_business')})", "Web Business"),
-                (f"Premium Website ({short('web_premium')})", "Web Premium"),
-                (f"Luxury Website ({short('web_luxury')})", "Web Luxury"),
-            ],
-        },
-        "bot": {
-            "title": {"EN": "🤖 **Telegram Bot Development**", "AM": "🤖 **የቴሌግራም ቦት ልማት**"},
-            "desc": {
-                "EN": (
-                    f"• **Basic Bot** – {fmt('bot_basic')}: welcome messages, service menus, business info, contact buttons.\n"
-                    f"• **Business Bot** – {fmt('bot_business')}: customer inquiries, FAQs, booking requests, lead collection, notifications.\n"
-                    f"• **Advanced Bot** – {fmt('bot_advanced')}: custom workflows, database connections, external integrations, payment features (if needed)."
-                ),
-                "AM": (
-                    f"• **Basic Bot** – {fmt('bot_basic', 'AM')}: መልእክቶች፣ የአገልግሎት ማውጫ፣ የስልክ ቁልፎች።\n"
-                    f"• **Business Bot** – {fmt('bot_business', 'AM')}: ደንበኛ ጥያቄዎች፣ ጥያቄና መልስ፣ የትዕዛዝ ጥያቄ፣ ማሳወቂያ።\n"
-                    f"• **Advanced Bot** – {fmt('bot_advanced', 'AM')}: ዳታቤዝ፣ ልዩ ሂደቶች፣ ክፍያ ማስተናገጃ።"
-                ),
-            },
-            "items": [
-                (f"Basic Bot ({short('bot_basic')})", "Bot Basic"),
-                (f"Business Bot ({short('bot_business')})", "Bot Business"),
-                (f"Advanced Bot ({short('bot_advanced')})", "Bot Advanced"),
-            ],
-        },
-        "bundles": {
-            "title": {"EN": "📦 **All-In-One Business Packages**", "AM": "📦 **ሙሉ የቢዝነስ ፓኬጆች (Bundles)**"},
-            "desc": {
-                "EN": (
-                    f"• **Digital Starter** – {fmt('bundle_starter')}: Email, Google Maps/GBP, FB+IG+TG setup, 3 posters.\n"
-                    f"• **Business Growth** – {fmt('bundle_growth')}: Website + Email, Google Maps, FB+IG+TG, 2 posters.\n"
-                    f"• **Digital Pro** – {fmt('bundle_pro')}: Premium website + Basic Bot + Email + Google Maps + FB+IG+TG + 5 posters.\n"
-                    f"• **Complete Digital Transformation** – {fmt('bundle_transf')}: Luxury website, advanced bot, email, Google Maps, social media setup, 5 posters, 2 short videos, online forms, cloud storage organization, AI tools & guidance, contact integration and launch support."
-                ),
-                "AM": (
-                    f"• **Digital Starter** – {fmt('bundle_starter', 'AM')}: ኢሜይል፣ ጉግል ማፕ፣ FB+IG+TG setup፣ 3 ፖስተር።\n"
-                    f"• **Business Growth** – {fmt('bundle_growth', 'AM')}: ዌብሳይት + ኢሜይል + ጉግል ማፕ + FB+IG+TG + 2 ፖስተር።\n"
-                    f"• **Digital Pro** – {fmt('bundle_pro', 'AM')}: ፕሪሚየም ዌብሳይት + ቦት + ኢሜይል + ጉግል ማፕ + FB+IG+TG + 5 ፖስተር።\n"
-                    f"• **Complete Transformation** – {fmt('bundle_transf', 'AM')}: Luxury ዌብሳይት + Advanced ቦት + ሙሉ ዲጂታል ሴታፕ፣ 2 አጫጭር ቪዲዮዎች እና ማስጀመሪያ ድጋፍ።"
-                ),
-            },
-            "items": [
-                (f"Digital Starter ({short('bundle_starter')})", "Bundle Starter"),
-                (f"Business Growth ({short('bundle_growth')})", "Bundle Growth"),
-                (f"Digital Pro ({short('bundle_pro')})", "Bundle Pro"),
-                (f"Transformation ({short('bundle_transf')})", "Bundle Transf"),
-            ],
-        },
-        "individual": {
-            "title": {"EN": "🛠 **Individual Services**", "AM": "🛠 **ነጠላ አገልግሎቶች**"},
-            "desc": {
-                "EN": "• Professional Email Setup: 700 ETB / account\n• Google Maps / Business Profile: 1,500 - 2,500 ETB\n• Social Media Setup (FB/IG/TG): 800 ETB each (All 3 for 2,000 ETB)\n• Poster Design: 500 ETB (5 Posters for 2,000 ETB)\n• Promotional Video Editing: 1,000 - 2,500 ETB\n• Online Form Creation: 1,000 ETB\n• Booking / Inquiry Setup: 2,500 ETB\n• File & Cloud Storage Organization: 1,500 - 3,000 ETB\n• AI Tools Setup & Guidance: 1,500 - 3,500 ETB\n\n✅ Small services (email, social media, basic design, etc.): pay only if satisfied!",
-                "AM": "• የድርጅት ኢሜይል (Professional Email): 700 ETB / አካውንት\n• ጉግል ማፕ (Google Maps / Business Profile): 1,500 - 2,500 ETB\n• ሶሻል ሚዲያ (FB/IG/TG): እያንዳንዳቸው 800 ETB (ሶስቱም 2,000 ETB)\n• የፖስተር ዲዛይን: 500 ETB (5 ፖስተር 2,000 ETB)\n• የቪዲዮ ኤዲቲንግ: 1,000 - 2,500 ETB\n• የኦንላይን ፎርም ዝግጅት: 1,000 ETB\n• የቀጠሮ / ጥያቄ ማስያዣ ሴታፕ: 2,500 ETB\n• የፋይል እና ክላውድ ስቶሬጅ ማደራጀት: 1,500 - 3,000 ETB\n• AI መሳሪያዎች ሴታፕ: 1,500 - 3,500 ETB\n\n✅ ትናንሽ አገልግሎቶች (ኢሜይል፣ ሶሻል ሚዲያ፣ ቀላል ዲዛይን): ከረኩ ብቻ ይክፈሉ!",
-            },
-            "items": [
-                ("Google Maps Setup", "Ind Google Maps"),
-                ("Social Media Setup (FB/IG/TG)", "Ind Social Setup"),
-                ("Poster / Video Design", "Ind Graphics"),
-                ("Professional Email Setup", "Ind Email"),
-                ("Online Forms / Booking Setup", "Ind Forms"),
-                ("File & Cloud Organization", "Ind Cloud"),
-                ("AI Tools Setup & Guidance", "Ind AI"),
-                ("Other / Inquiry", "Ind Custom"),
-            ],
-        },
-        "monthly": {
-            "title": {"EN": "📅 **Monthly Content Packages**", "AM": "📅 **የሶሻል ሚዲያ ወርሃዊ ፓኬጆች**"},
-            "desc": {
-                "EN": "• **Content Starter (4,000 ETB/mo):** 8 promo designs with captions.\n• **Content Growth (8,000 ETB/mo):** 12 promo designs + 4 short videos + schedule.\n• **Custom Content Plan (From 12,000 ETB/mo):** Tailored content and video strategy.",
-                "AM": "• **Content Starter (4,000 ETB/ወር):** 8 ፖስተሮች ከጽሁፍ ጋር።\n• **Content Growth (8,000 ETB/ወር):** 12 ፖስተሮች + 4 አጫጭር ቪዲዮዎች + የፖስት መርሃግብር።\n• **Custom Content Plan (ከ 12,000 ETB/ወር):** እንደ ቢዝነስዎ ፍላጎት የተዘጋጀ።",
-            },
-            "items": [
-                ("Content Starter (4,000 ETB/mo)", "Monthly Starter"),
-                ("Content Growth (8,000 ETB/mo)", "Monthly Growth"),
-                ("Custom Content Plan (12,000+ ETB/mo)", "Monthly Custom"),
-            ],
-        },
-    }
-
-
-def category_text(cat_key, lang):
-    cat_data = get_catalog()[cat_key]
-    text = f"{cat_data['title'][lang]}\n\n"
-    if offer_on() and cat_key != "individual" and cat_key != "monthly":
-        text += OFFER_BANNER[lang] + "\n\n"
-    return text + cat_data["desc"][lang]
-
-
-def item_label(code):
-    """Readable name (with current price) for a package code."""
-    for cat in get_catalog().values():
-        for label, item_code in cat["items"]:
-            if item_code == code:
-                return label
-    return code
-
-# ==================== KEYBOARD BUILDERS ====================
-def get_channel_lock_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url="https://t.me/LZDigitalAgency")],
-        [InlineKeyboardButton("🔄 Verify Membership", callback_data="verify_subscription")]
-    ])
-
-def get_lang_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🇬🇧 English", callback_data="set_lang_EN"),
-         InlineKeyboardButton("🇪🇹 አማርኛ", callback_data="set_lang_AM")]
-    ])
-
-def get_main_menu_keyboard(lang):
-    t = TEXTS[lang]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["cat_web"], callback_data="cat_web")],
-        [InlineKeyboardButton(t["cat_bot"], callback_data="cat_bot")],
-        [InlineKeyboardButton(t["cat_bundles"], callback_data="cat_bundles")],
-        [InlineKeyboardButton(t["cat_individual"], callback_data="cat_individual")],
-        [InlineKeyboardButton(t["cat_monthly"], callback_data="cat_monthly")],
-        [InlineKeyboardButton(t["cat_social"], callback_data="cat_social")],
-        [InlineKeyboardButton(t["cat_custom"], callback_data="cat_custom")],
-        [InlineKeyboardButton(t["change_lang"], callback_data="change_language")]
-    ])
-
-def get_category_keyboard(cat_key, lang):
-    t = TEXTS[lang]
-    items = get_catalog()[cat_key]["items"]
-    keyboard = []
-    for label, code in items:
-        keyboard.append([InlineKeyboardButton(f"👉 {label}", callback_data=f"select_pkg_{code}")])
-    keyboard.append([InlineKeyboardButton(t["back"], callback_data="main_menu")])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_order_keyboard(lang):
-    t = TEXTS[lang]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["order_btn"], callback_data="start_order")],
-        [InlineKeyboardButton(t["back"], callback_data="main_menu")]
-    ])
-
-def get_socials_keyboard(lang):
-    t = TEXTS[lang]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌐 Visit Website", url="https://lzdigital20-del.github.io/lzdigital20-gmail.com/")],
-        [InlineKeyboardButton("🎵 TikTok", url="https://www.tiktok.com/@lzdigitalagency"),
-         InlineKeyboardButton("👥 Facebook", url="https://www.facebook.com/share/18kVXFqXtE/")],
-        [InlineKeyboardButton(t["back"], callback_data="main_menu")]
-    ])
-
-# ==================== SUBSCRIPTION CHECK HELPER ====================
-async def check_user_subscription(bot, user_id):
-    try:
-        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        # Statuses that mean the user is joined/subscribed
-        if member.status in ["creator", "administrator", "member"]:
-            return True
-    except TelegramError as e:
-        logging.error(f"Failed to check subscription status for user {user_id}: {e}")
-    return False
-
-# ==================== HANDLERS ====================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    # Check if user is subscribed to the channel
-    is_subscribed = await check_user_subscription(context.bot, user_id)
-    if not is_subscribed:
-        lock_msg = (
-            "🚨 **Channel Subscription Required!**\n\n"
-            "To use this bot and access LZ DIGITAL services, you must join our official Telegram channel first:\n"
-            "👉 @LZDigitalAgency\n\n"
-            "After joining, click **Verify Membership** below! 👇\n\n"
-            "─────────────────────────────\n"
-            "🚨 **የቻናል አባል መሆን ይጠበቅብዎታል!**\n\n"
-            "ይህንን ቦት ለመጠቀም ቅድሚያ ኦፊሴላዊ የቴሌግራም ቻናላችንን መቀላቀል አለብዎት።\n"
-            "👉 @LZDigitalAgency\n\n"
-            "ከተቀላቀሉ በኋላ ከታች ያለውን **Verify Membership** የሚለውን ይጫኑ!"
-        )
-        if update.message:
-            await update.message.reply_text(lock_msg, parse_mode="Markdown", reply_markup=get_channel_lock_keyboard())
-        elif update.callback_query:
-            await update.callback_query.answer("⚠️ Please join the channel first!", show_alert=True)
-            try:
-                await update.callback_query.edit_message_text(lock_msg, parse_mode="Markdown", reply_markup=get_channel_lock_keyboard())
-            except TelegramError:
-                pass
-        return
-
-    # If subscribed, proceed normally
-    context.user_data["lang"] = context.user_data.get("lang", "EN")
-    if update.message:
-        await update.message.reply_text(
-            TEXTS["EN"]["welcome"],
-            parse_mode="Markdown",
-            reply_markup=get_lang_keyboard()
-        )
-    elif update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            TEXTS["EN"]["welcome"],
-            parse_mode="Markdown",
-            reply_markup=get_lang_keyboard()
-        )
-
-async def verify_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    is_subscribed = await check_user_subscription(context.bot, user_id)
-    if not is_subscribed:
-        await query.answer("❌ You have not joined the channel yet! Please join @LZDigitalAgency first.", show_alert=True)
-        return
-
-    await query.answer("✅ Verified successfully! Welcome!", show_alert=False)
-    context.user_data["lang"] = context.user_data.get("lang", "EN")
-    await query.edit_message_text(
-        TEXTS["EN"]["welcome"],
-        parse_mode="Markdown",
-        reply_markup=get_lang_keyboard()
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-
-    help_text = (
-        "🤖 **LZ DIGITAL Bot Commands Help:**\n\n"
-        "• `/start` - Launch bot & choose language\n"
-        "• `/services` - View main service menu\n"
-        "• `/website` - Website development packages\n"
-        "• `/bot` - Telegram bot packages\n"
-        "• `/bundles` - Business bundles\n"
-        "• `/individual` - Individual services\n"
-        "• `/monthly` - Monthly content plans\n"
-        "• `/socials` - View website & social media links\n"
-        "• `/contact` - Contact info & custom quote\n"
-        "• `/help` - Show command list"
-    )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
-
-async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-    lang = context.user_data.get("lang", "EN")
-    await update.message.reply_text(main_menu_text(lang), parse_mode="Markdown", reply_markup=get_main_menu_keyboard(lang))
-
-
-def category_command(cat_key):
-    """Creates the /website, /bot, /bundles, /individual and /monthly commands."""
-    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not await check_user_subscription(context.bot, user_id):
-            await start_command(update, context)
-            return
-        lang = context.user_data.get("lang", "EN")
-        await update.message.reply_text(
-            category_text(cat_key, lang),
-            parse_mode="Markdown",
-            reply_markup=get_category_keyboard(cat_key, lang)
-        )
-    return handler
-
-cmd_web = category_command("web")
-cmd_bot = category_command("bot")
-cmd_bundles = category_command("bundles")
-cmd_individual = category_command("individual")
-cmd_monthly = category_command("monthly")
-
-async def cmd_socials(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-    lang = context.user_data.get("lang", "EN")
-    social_text = (
-        "🔗 **LZ DIGITAL Official Links**\n\n"
-        "Explore our online platforms below:"
-    )
-    await update.message.reply_text(social_text, parse_mode="Markdown", reply_markup=get_socials_keyboard(lang))
-
-async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-    context.user_data["selected_item"] = "Custom Consultation / Inquiry"
-    await update.message.reply_text(
-        f"📞 **{t['cat_custom']}**\n\nDirect Contacts:\n📱 Phone: +251 957 134 860 / +251 948 696 673\n📩 Email: lzdigital20@gmail.com",
-        parse_mode="Markdown",
-        reply_markup=get_order_keyboard(lang)
-    )
-
-async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-
-    await query.answer()
-    lang = query.data.split("_")[-1]
-    context.user_data["lang"] = lang
-
-    await query.edit_message_text(
-        main_menu_text(lang),
-        parse_mode="Markdown",
-        reply_markup=get_main_menu_keyboard(lang)
-    )
-
-async def handle_menu_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-
-    await query.answer()
-    data = query.data
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-
-    if data == "main_menu":
-        await query.edit_message_text(main_menu_text(lang), parse_mode="Markdown", reply_markup=get_main_menu_keyboard(lang))
-
-    elif data == "change_language":
-        await query.edit_message_text(t["welcome"], parse_mode="Markdown", reply_markup=get_lang_keyboard())
-
-    elif data == "cat_social":
-        social_text = (
-            "🔗 **LZ DIGITAL Official Links**\n\n"
-            "Explore our online platforms below:"
-        )
-        await query.edit_message_text(social_text, parse_mode="Markdown", reply_markup=get_socials_keyboard(lang))
-
-    elif data.startswith("cat_"):
-        cat_key = data.replace("cat_", "")
-        if cat_key == "custom":
-            context.user_data["selected_item"] = "Custom Consultation / Inquiry"
-            await query.edit_message_text(
-                f"📞 **{t['cat_custom']}**\n\nDirect Contacts:\n📱 Phone: +251 957 134 860 / +251 948 696 673\n📩 Email: lzdigital20@gmail.com",
-                parse_mode="Markdown",
-                reply_markup=get_order_keyboard(lang)
-            )
-            return SELECTING_PACKAGE
-
-        await query.edit_message_text(
-            category_text(cat_key, lang),
-            parse_mode="Markdown",
-            reply_markup=get_category_keyboard(cat_key, lang)
-        )
-
-    elif data.startswith("select_pkg_"):
-        pkg_code = data.replace("select_pkg_", "")
-        context.user_data["selected_item"] = pkg_code
-        await query.edit_message_text(
-            f"📌 **Selected:** {item_label(pkg_code)}\n\nClick below to proceed with your request:",
-            parse_mode="Markdown",
-            reply_markup=get_order_keyboard(lang)
-        )
-        return SELECTING_PACKAGE
-
-async def initiate_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not await check_user_subscription(context.bot, user_id):
-        await start_command(update, context)
-        return
-
-    await query.answer()
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-
-    await query.edit_message_text(t["prompt_name"], parse_mode="Markdown")
-    return ENTERING_NAME
-
-async def get_business_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-    context.user_data["order_name"] = update.message.text
-
-    await update.message.reply_text(t["prompt_phone"], parse_mode="Markdown")
-    return ENTERING_PHONE
-
-async def get_phone_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-    context.user_data["order_phone"] = update.message.text
-
-    await update.message.reply_text(t["prompt_notes"], parse_mode="Markdown")
-    return ENTERING_NOTES
-
-async def finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = context.user_data.get("lang", "EN")
-    t = TEXTS[lang]
-    context.user_data["order_notes"] = update.message.text
-
-    user = update.message.from_user
-    raw_item = context.user_data.get("selected_item", "General Request")
-    b_name = context.user_data.get("order_name", "N/A")
-    phone = context.user_data.get("order_phone", "N/A")
-    notes = context.user_data.get("order_notes", "None")
-
-    # Package name + the price the client saw (includes the Grand Opening price while it runs)
-    item = item_label(raw_item)
-    if offer_on() and raw_item in ("Custom Consultation / Inquiry", "General Request"):
-        pass
-    elif offer_on():
-        item += " [Grand Opening offer]"
-
-    lead_info = {
-        "user_id": user.id,
-        "username": user.username,
-        "full_name": user.full_name,
-        "item": item,
-        "business_name": b_name,
-        "phone": phone,
-        "notes": notes
-    }
-    lead_logs.append(lead_info)
-
-    await update.message.reply_text(t["success_msg"], parse_mode="Markdown")
-
-    admin_alert_text = (
-        "🚨 NEW LZ DIGITAL LEAD / ORDER RECEIVED!\n"
-        "─────────────────────────────\n"
-        f"📦 Requested Service: {item}\n"
-        f"🏢 Business/Client Name: {b_name}\n"
-        f"📞 Phone Number: {phone}\n"
-        f"💬 Client Notes: {notes}\n"
-        "─────────────────────────────\n"
-        f"👤 Telegram User: {user.full_name} (@{user.username})\n"
-        f"🆔 Telegram ID: {user.id}"
-    )
-
-    try:
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_alert_text)
-    except Exception as e:
-        logging.error(f"Failed to send alert to admin chat ID {ADMIN_CHAT_ID}: {e}")
-
-    return ConversationHandler.END
-
-# ==================== ADMIN PANEL HANDLERS ====================
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Unauthorized access.")
-        return
-
-    admin_panel_text = (
-        "⚙️ **LZ DIGITAL Admin Panel**\n\n"
-        f"📊 **Total Leads Received:** {len(lead_logs)}\n"
-        f"🎉 **Grand Opening offer:** {'ACTIVE (until Nov 15, 2026)' if offer_on() else 'ended'}\n\n"
-        "Use commands:\n"
-        "• `/leads` - View recent 5 orders/inquiries"
-    )
-    await update.message.reply_text(admin_panel_text, parse_mode="Markdown")
-
-async def view_leads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_CHAT_ID:
-        return
-
-    if not lead_logs:
-        await update.message.reply_text("📥 No leads recorded yet.")
-        return
-
-    msg = "📥 **Recent Leads (Last 5):**\n\n"
-    for idx, lead in enumerate(lead_logs[-5:], 1):
-        msg += (
-            f"**{idx}. {lead['item']}**\n"
-            f"• Client: {lead['business_name']}\n"
-            f"• Phone: `{lead['phone']}`\n"
-            f"• User: @{lead['username']} ({lead['full_name']})\n"
-            f"• Notes: {lead['notes']}\n"
-            "───────────────\n"
-        )
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ==================== RENDER DUMMY WEB SERVER ====================
-async def handle_ping(request):
-    return web.Response(text="LZ DIGITAL Bot is live and running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logging.info(f"Web server started on port {PORT}")
-
-# ==================== MAIN APPLICATION BUILDER ====================
-async def main_async():
-    await start_web_server()
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    order_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(initiate_order, pattern="^start_order$")],
-        states={
-            ENTERING_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_business_name)],
-            ENTERING_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone_number)],
-            ENTERING_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, finalize_order)],
-        },
-        fallbacks=[CommandHandler("start", start_command)],
-    )
-
-    # Command Handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("services", cmd_services))
-    app.add_handler(CommandHandler("website", cmd_web))
-    app.add_handler(CommandHandler("bot", cmd_bot))
-    app.add_handler(CommandHandler("bundles", cmd_bundles))
-    app.add_handler(CommandHandler("individual", cmd_individual))
-    app.add_handler(CommandHandler("monthly", cmd_monthly))
-    app.add_handler(CommandHandler("socials", cmd_socials))
-    app.add_handler(CommandHandler("contact", cmd_contact))
-
-    # Admin Handlers
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("leads", view_leads_command))
-
-    app.add_handler(CallbackQueryHandler(verify_subscription_callback, pattern="^verify_subscription$"))
-    app.add_handler(CallbackQueryHandler(set_language, pattern="^set_lang_"))
-    app.add_handler(order_conv)
-    app.add_handler(CallbackQueryHandler(handle_menu_navigation))
-
-    print("🚀 LZ DIGITAL Telegram Bot is running on Web Service...")
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main_async())
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#05070c">
+  <meta name="google-site-verification" content="tLh30K2T1etrj5mqmxN9aH560gb9LkyXf6WHr8uyqeA" />
+  <meta name="google-site-verification" content="7r-nzkCE-Vw8Xt1bMJ5npW3EkiHNwM429C6v9-c8OWQ" />
+  <meta name="description" content="LZ Digital: websites, Telegram bots, business email, Google Maps and social setup in Ethiopia. Grand Opening discount on all packages until November 15, 2026.">
+  <title>LZ Digital — Helping Businesses Grow</title>
+  <link rel="icon" type="image/png" href="logo.jpg">
+<style>
+:root{--bg:#05070c;--panel:#0c121a;--gold:#e2bb5f;--blue:#238cff;--cyan:#58d8ff;--text:#f7f9fc;--muted:#9eabb9;--line:rgba(255,255,255,.1)}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:radial-gradient(circle at 15% 0,rgba(35,140,255,.15),transparent 30%),radial-gradient(circle at 85% 10%,rgba(226,187,95,.1),transparent 25%),linear-gradient(180deg,#03050a,#070b12 45%,#03050a);color:var(--text);font-family:Inter,Arial,sans-serif;line-height:1.6}a{color:inherit}.container{width:min(1160px,92%);margin:auto}header{position:sticky;top:0;z-index:50;background:rgba(4,6,10,.84);backdrop-filter:blur(15px);border-bottom:1px solid var(--line)}.nav{min-height:75px;display:flex;align-items:center;justify-content:space-between;gap:20px}.brand{display:flex;align-items:center;gap:12px;text-decoration:none}.brand img{width:48px;height:48px;object-fit:cover;border-radius:14px;border:1px solid rgba(226,187,95,.35)}.brand b{display:block;letter-spacing:.14em;font-size:14px}.brand small{color:var(--muted);letter-spacing:.15em;font-size:10px;text-transform:uppercase}.links{display:flex;gap:4px;flex-wrap:wrap}.links a{padding:9px 11px;border-radius:10px;text-decoration:none;color:#d7dee7;font-size:13px}.links a:hover,.links a.active{color:#f0d68e;background:rgba(226,187,95,.09)}.menu{display:none;background:none;color:#f0d68e;border:1px solid var(--line);border-radius:10px;padding:9px 11px}.hero{min-height:calc(100vh - 75px);display:grid;place-items:center;position:relative;overflow:hidden}.hero:before{content:"";position:absolute;inset:-20%;background:radial-gradient(circle at 75% 25%,rgba(35,140,255,.18),transparent 18%),radial-gradient(circle at 80% 65%,rgba(226,187,95,.1),transparent 18%),linear-gradient(125deg,transparent 38%,rgba(255,255,255,.04) 49%,transparent 53%);transform:rotate(-7deg)}.hero-grid{position:relative;z-index:1;display:grid;grid-template-columns:1.1fr .9fr;gap:45px;align-items:center;padding:70px 0}.eyebrow{font-size:12px;color:#f0d68e;letter-spacing:.18em;font-weight:900;text-transform:uppercase}.hero h1{font-size:clamp(45px,7vw,84px);line-height:.98;letter-spacing:-.05em;margin:15px 0}.hero h1 span{background:linear-gradient(95deg,#fff,#e3bd65,#5ed5ff);-webkit-background-clip:text;background-clip:text;color:transparent}.lead{color:#c4ced9;font-size:18px;max-width:720px}.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:28px}.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:47px;padding:12px 16px;border-radius:12px;border:1px solid var(--line);text-decoration:none;font-weight:850;transition:.2s}.btn:hover{transform:translateY(-2px)}.gold{background:linear-gradient(135deg,#f5da91,#dbae46);color:#0a0a0a;border:0}.blue{background:linear-gradient(135deg,#1687ff,#5cd7ff);color:#04101a;border:0}.ghost{background:rgba(255,255,255,.035)}.hero-card{background:linear-gradient(145deg,rgba(255,255,255,.05),rgba(255,255,255,.015));border:1px solid var(--line);border-radius:25px;padding:26px;box-shadow:0 30px 90px rgba(0,0,0,.42)}.hero-card .big{font-size:39px;font-weight:950;line-height:1.03;margin:25px 0 15px}.metric{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:25px}.metric div{padding:13px;border:1px solid var(--line);border-radius:13px;background:#0a0f16}.metric b{display:block;color:#f0d68e;font-size:22px}.metric span{font-size:11px;color:var(--muted)}.page{display:none;padding:84px 0}.page.active{display:block;animation:in .3s ease}@keyframes in{from{opacity:.2;transform:translateY(6px)}to{opacity:1;transform:none}}.head{display:flex;justify-content:space-between;align-items:end;gap:24px;margin-bottom:28px}.head h2{font-size:clamp(34px,5vw,54px);line-height:1;margin:8px 0 0;letter-spacing:-.045em}.head p{max-width:620px;color:var(--muted);margin:0}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:17px}.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:17px}.card{background:linear-gradient(145deg,rgba(255,255,255,.045),rgba(255,255,255,.017));border:1px solid var(--line);border-radius:21px;padding:23px;box-shadow:0 20px 55px rgba(0,0,0,.26)}.icon{width:45px;height:45px;border-radius:13px;display:grid;place-items:center;border:1px solid rgba(226,187,95,.2);background:linear-gradient(145deg,rgba(35,140,255,.12),rgba(226,187,95,.1));margin-bottom:13px}.card h3{margin:0 0 8px}.card p{margin:0;color:var(--muted)}.list{display:grid;gap:8px;margin-top:15px}.list div:before{content:'✓';color:#f0d68e;font-weight:900;margin-right:8px}.contact{display:grid}.contact-item{display:flex;gap:13px;padding:16px 0;border-bottom:1px solid rgba(255,255,255,.07)}.contact-item:last-child{border-bottom:0}.i{font-size:21px}.tag{display:inline-flex;padding:6px 9px;border:1px solid var(--line);border-radius:999px;font-size:11px;color:#c8d1dc;margin:3px}.form{display:grid;gap:15px}.field{display:grid;gap:7px}label{font-weight:800;font-size:13px}input,textarea,select{width:100%;padding:12px 13px;border-radius:11px;background:#080d14;border:1px solid #28323f;color:white;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--gold);box-shadow:0 0 0 3px rgba(226,187,95,.1)}.result{display:none;padding:13px;border:1px solid rgba(83,215,135,.3);background:rgba(83,215,135,.08);border-radius:13px}.faq details{padding:16px 18px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.02)}.faq details+details{margin-top:10px}.faq summary{cursor:pointer;font-weight:850}.notice{padding:14px;border:1px solid rgba(226,187,95,.23);background:rgba(226,187,95,.06);border-radius:14px;color:#e9ddb9}footer{border-top:1px solid var(--line);padding:35px 0 55px;color:var(--muted)}.foot{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.float{position:fixed;right:17px;bottom:17px;z-index:70;display:flex;flex-direction:column;gap:9px}.float a{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;text-decoration:none;background:#0a1018;border:1px solid rgba(226,187,95,.25);box-shadow:0 14px 40px rgba(0,0,0,.45)}svg{display:block}
+/* ---- Pricing & Grand Opening ---- */
+.offer-bar{background:linear-gradient(90deg,#c99a37,#f5da91,#c99a37);color:#0a0a0a;text-align:center;font-size:13px;font-weight:800;padding:8px 12px}.offer-bar a{text-decoration:none}.offer-bar u{text-underline-offset:3px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:17px}
+.deal{display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:8px;border-color:rgba(226,187,95,.4);background:linear-gradient(120deg,rgba(226,187,95,.14),rgba(35,140,255,.08))}
+.deal h3{font-size:clamp(22px,3vw,30px);margin:0 0 4px}.deal p{color:#e9ddb9}
+.clock{text-align:right}.clock small{display:block;color:var(--muted);font-size:12px}.clock b{font-size:26px;color:#f0d68e;letter-spacing:-.02em}
+.sub{margin:52px 0 6px;font-size:clamp(24px,3vw,32px);letter-spacing:-.035em;line-height:1.1}.subp{margin:0 0 20px;color:var(--muted)}
+.pk{display:flex;flex-direction:column}.pk h3{font-size:20px;margin:0}.pk .pg{color:var(--muted);font-size:13px;margin:2px 0 0}.pk .list{flex:1;font-size:14px}
+.pk.hot{border-color:rgba(226,187,95,.5)}.pk.cyan{border-color:rgba(88,216,255,.35)}
+.price{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px;margin:16px 0 0;padding-top:14px;border-top:1px solid rgba(255,255,255,.08)}.price .now{font-size:24px;font-weight:950;color:#f0d68e;letter-spacing:-.03em;line-height:1.15}.price s{color:var(--muted);font-size:13px}
+.off{background:linear-gradient(135deg,#f5da91,#dbae46);color:#0a0a0a;font-weight:900;font-size:11px;padding:3px 8px;border-radius:999px;white-space:nowrap}
+.feature{display:grid;grid-template-columns:1.35fr .65fr;gap:28px;border-color:rgba(226,187,95,.5);background:linear-gradient(145deg,rgba(226,187,95,.1),rgba(35,140,255,.07))}.feature h3{font-size:clamp(26px,3.4vw,38px);letter-spacing:-.04em;line-height:1.05;margin:6px 0 8px}
+.cols2{grid-template-columns:repeat(2,1fr);column-gap:22px}
+.big-price{align-self:center;text-align:center;padding:24px;border:1px solid rgba(226,187,95,.4);border-radius:18px;background:rgba(5,7,12,.5)}.big-price .now{display:block;font-size:clamp(34px,5vw,48px);font-weight:950;color:#f0d68e;letter-spacing:-.04em;line-height:1}.big-price s{display:block;color:var(--muted);margin:8px 0 12px}
+.rows{display:grid;grid-template-columns:repeat(2,1fr);column-gap:40px}.row{display:flex;justify-content:space-between;align-items:baseline;gap:14px;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.07)}.row span{color:#d7dee7}.row b{color:#f0d68e;white-space:nowrap;text-align:right}
+.ended,.offer-off .offer-bar,.offer-off .off,.offer-off .price s,.offer-off .big-price s,.offer-off .deal.live{display:none}.offer-off .ended{display:block}
+.fine{margin-top:16px;color:var(--muted);font-size:13px}
+@media(max-width:1100px){.grid4{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:950px){.links{display:none;position:absolute;top:75px;left:4%;right:4%;padding:10px;background:rgba(5,8,13,.98);border:1px solid var(--line);border-radius:13px;flex-direction:column}.links.open{display:flex}.menu{display:block}.hero-grid,.grid2,.grid3,.grid4,.feature,.rows{grid-template-columns:1fr}.hero{min-height:auto}.head{align-items:start;flex-direction:column}.clock{text-align:left}}@media(max-width:560px){.metric{grid-template-columns:1fr}.cols2{grid-template-columns:1fr}}
+/* ---- Animations ---- */
+@keyframes rise{from{opacity:0;transform:translateY(26px)}to{opacity:1;transform:none}}
+@keyframes floaty{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+@keyframes shine{to{background-position:200% center}}
+@keyframes barshine{to{background-position:200% 0}}
+@keyframes drift{0%,100%{transform:rotate(-7deg) translate(0,0)}50%{transform:rotate(-5deg) translate(2%,3%)}}
+@keyframes sweep{0%,55%{left:-60%}100%{left:140%}}
+@keyframes pulse{0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(245,218,145,.55)}50%{transform:scale(1.06);box-shadow:0 0 0 7px rgba(245,218,145,0)}}
+@keyframes glow{0%,100%{box-shadow:0 20px 55px rgba(0,0,0,.26),0 0 0 rgba(226,187,95,0)}50%{box-shadow:0 20px 55px rgba(0,0,0,.26),0 0 40px rgba(226,187,95,.28)}}
+@keyframes ring{0%{box-shadow:0 0 0 0 rgba(88,216,255,.55)}70%,100%{box-shadow:0 0 0 16px rgba(88,216,255,0)}}
+@keyframes tickpop{0%,100%{color:#f0d68e}50%{color:#fff}}
+.offer-bar{background:linear-gradient(90deg,#c99a37,#f5da91,#c99a37,#f5da91,#c99a37);background-size:200% 100%;animation:barshine 9s linear infinite}
+.hero:before{animation:drift 16s ease-in-out infinite}
+.hero h1 span{background-image:linear-gradient(95deg,#fff,#e3bd65,#5ed5ff,#e3bd65,#fff);background-size:200% auto;animation:shine 7s linear infinite}
+.hero-grid>div:first-child>*{animation:rise .8s cubic-bezier(.2,.7,.2,1) both}
+.hero-grid>div:first-child>:nth-child(2){animation-delay:.12s}.hero-grid>div:first-child>:nth-child(3){animation-delay:.24s}.hero-grid>div:first-child>:nth-child(4){animation-delay:.36s}
+.hero-card{animation:rise .9s .3s cubic-bezier(.2,.7,.2,1) both,floaty 6s 1.3s ease-in-out infinite}
+.metric div{transition:border-color .25s,transform .25s}.metric div:hover{border-color:rgba(226,187,95,.5);transform:translateY(-3px)}
+.btn.gold,.btn.blue{position:relative;overflow:hidden}
+.btn.gold:after{content:"";position:absolute;top:0;left:-60%;width:35%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.6),transparent);transform:skewX(-20deg);animation:sweep 3.6s ease-in-out infinite;pointer-events:none}
+.btn{transition:transform .2s,box-shadow .25s}.btn.gold:hover{box-shadow:0 10px 30px rgba(226,187,95,.35)}.btn.blue:hover{box-shadow:0 10px 30px rgba(35,140,255,.4)}
+.card{transition:transform .28s,border-color .28s,box-shadow .28s}
+.pk:hover,.grid3>.card:hover,.grid2>.card:hover:not(:has(form)){transform:translateY(-6px);border-color:rgba(226,187,95,.4);box-shadow:0 26px 60px rgba(0,0,0,.4)}
+.icon{transition:transform .35s}.card:hover .icon{transform:rotate(-8deg) scale(1.12)}
+.off{animation:pulse 2.6s ease-in-out infinite}
+.feature{animation:glow 4.5s ease-in-out infinite}
+.clock b{animation:tickpop 2s ease-in-out infinite}
+.row{transition:background .2s,padding .2s}.row:hover{background:rgba(226,187,95,.06);padding-left:8px;padding-right:8px}
+.faq details{transition:border-color .25s,background .25s}.faq details[open],.faq details:hover{border-color:rgba(226,187,95,.35);background:rgba(226,187,95,.04)}
+.faq details[open] p{animation:rise .35s both}
+.float a{transition:transform .25s}.float a:hover{transform:translateY(-4px) scale(1.08)}.float a:first-child{animation:ring 2.8s ease-out infinite}
+.rv{opacity:0;transform:translateY(24px);transition:opacity .65s ease var(--d,0ms),transform .65s cubic-bezier(.2,.7,.2,1) var(--d,0ms)}.rv.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}.rv{opacity:1!important;transform:none!important}}
+</style></head><body>
+<div class="offer-bar"><a href="#pricing" data-page="pricing">🎉 Grand Opening: special discount on all packages &amp; services until Nov 15, 2026. <u>See pricing</u></a></div>
+<header><div class="container nav"><a class="brand" href="#home" data-page="home"><img src="logo.jpg" alt="Official LZ Digital logo" onerror="this.style.display='none'"><div><b>LZ DIGITAL</b><small>Helping businesses grow</small></div></a><button class="menu" id="menu">☰</button><nav class="links" id="links"><a href="#home" data-page="home">Home</a><a href="#services" data-page="services">Services</a><a href="#pricing" data-page="pricing">Pricing</a><a href="#work" data-page="work">Our Work</a><a href="#process" data-page="process">Process</a><a href="#about" data-page="about">About</a><a href="#faq" data-page="faq">FAQ</a><a href="#contact" data-page="contact">Contact</a><a href="#start" data-page="start" style="color:#f0d68e">Start a Project</a></nav></div></header>
+<section class="hero" id="hero"><div class="container hero-grid"><div><div class="eyebrow">Websites • Digital setup • Business systems</div><h1>Make your business <span>digitally stronger.</span></h1><p class="lead">LZ Digital helps businesses create a professional online presence through websites, business profiles, professional email, social pages, online forms, digital organization and practical AI tools.</p><div class="actions"><a class="btn gold" href="#start" data-page="start">Start a Project →</a><a class="btn ghost" href="#pricing" data-page="pricing" style="border-color:rgba(226,187,95,.4);color:#f0d68e">View Pricing</a><a class="btn blue" href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" aria-label="Telegram"><path fill="currentColor" d="M21.4 3.6 2.9 10.7c-.9.36-.87.86-.16 1.08l4.73 1.48 1.82 5.55c.22.61.11.86.75.86.49 0 .71-.23.98-.5l2.37-2.3 4.93 3.64c.91.5 1.57.24 1.8-.84l3.15-14.87c.34-1.31-.5-1.9-1.87-1.29ZM8.2 12.92l10.98-6.93c.55-.33 1.06-.15.64.21l-8.88 8.02-.34 3.63-1.4-4.93-1-.31Z"/></svg>Telegram</a><a class="btn ghost" href="mailto:lzdigital20@gmail.com">✉ Email Us</a></div></div><div class="hero-card"><div class="eyebrow">LZ Digital</div><div class="big">Visible.<br>Professional.<br>Connected.</div><p style="color:#aeb9c8">We connect the digital pieces that help customers discover, understand and contact a business.</p><div class="metric"><div><b>01</b><span>Build</span></div><div><b>02</b><span>Connect</span></div><div><b>03</b><span>Grow</span></div></div></div></div></section>
+<main>
+<section class="page active" id="home"><div class="container"><div class="head"><div><div class="eyebrow">What we do</div><h2>Digital work that is actually useful.</h2></div><p>From first setup to a complete online presence, LZ Digital focuses on practical systems a business can keep using.</p></div><div class="grid3"><div class="card"><div class="icon">🌐</div><h3>Professional Websites</h3><p>Modern, responsive websites that make a business easier to understand and contact.</p></div><div class="card"><div class="icon">📍</div><h3>Google Business Setup</h3><p>Help organizing business details and location presence for customers searching online.</p></div><div class="card"><div class="icon">✉️</div><h3>Business Email</h3><p>Professional email setup and contact flows around the business identity.</p></div><div class="card"><div class="icon">📱</div><h3>Social Pages</h3><p>Facebook, Instagram and Telegram business presence setup and organization.</p></div><div class="card"><div class="icon">📝</div><h3>Online Forms</h3><p>Booking, registration, customer request and inquiry forms.</p></div><div class="card"><div class="icon">🤖</div><h3>AI Tools &amp; Telegram Bots</h3><p>Practical AI workflows and Telegram bots for content, customer inquiries and everyday business tasks.</p></div></div>
+<div class="card deal live" style="margin-top:22px"><div><h3>Grand Opening discount</h3><p>Websites from <strong class="now" data-now="7,200 ETB" data-was="8,000 ETB">7,200 ETB</strong>. Special discount on all packages and services until November 15, 2026.</p></div><a class="btn gold" href="#pricing" data-page="pricing">See all prices →</a></div></div></section>
+<section class="page" id="services"><div class="container"><div class="head"><div><div class="eyebrow">Services</div><h2>Your digital toolkit.</h2></div><p>Pick one service or combine several into one digital setup. <a href="#pricing" data-page="pricing" style="color:#f0d68e">See prices</a>.</p></div><div class="grid2"><div class="card"><h3>🌐 Website Creation</h3><div class="list"><div>Business websites</div><div>Landing pages</div><div>Mobile-friendly layouts</div><div>Forms, contact and action sections</div></div></div><div class="card"><h3>📍 Google Maps &amp; Business Presence</h3><div class="list"><div>Business information setup</div><div>Location and contact details</div><div>Profile presentation</div><div>Verification guidance</div></div></div><div class="card"><h3>✉️ Professional Email</h3><div class="list"><div>Business mailbox setup</div><div>Gmail / Workspace guidance</div><div>Email links and contact flow</div><div>Basic account organization</div></div></div><div class="card"><h3>📲 Social &amp; Telegram Setup</h3><div class="list"><div>Facebook business page</div><div>Instagram setup</div><div>Telegram channel setup</div><div>Profile information and links</div></div></div><div class="card"><h3>🎨 Canva &amp; Visual Materials</h3><div class="list"><div>Promotional posters</div><div>Social media graphics</div><div>Reusable templates</div><div>Basic visual consistency</div></div></div><div class="card"><h3>🗂️ Digital Organization</h3><div class="list"><div>Google Drive organization</div><div>Files and folders</div><div>Cloud structure</div><div>Simple workflows</div></div></div><div class="card"><h3>📝 Forms &amp; Booking Systems</h3><div class="list"><div>Customer forms</div><div>Booking forms</div><div>Registration forms</div><div>Inquiry flows</div></div></div><div class="card"><h3>🤖 AI Tools &amp; Workflows</h3><div class="list"><div>AI tool selection</div><div>Prompt/workflow setup</div><div>Content assistance</div><div>Automation ideas</div></div></div><div class="card"><h3>💬 Telegram Bots</h3><div class="list"><div>Welcome messages and service menus</div><div>Customer inquiries, FAQs and bookings</div><div>Lead collection and notifications</div><div>Custom workflows and integrations</div></div></div><div class="card"><h3>🎬 Video &amp; Content</h3><div class="list"><div>Short promotional videos</div><div>Monthly designs and captions</div><div>Content schedules</div><div>Custom content plans</div></div></div></div></div></section>
+
+<section class="page" id="pricing"><div class="container"><div class="head"><div><div class="eyebrow">Pricing</div><h2>Clear prices. Opening discount.</h2></div><p>All prices are in Ethiopian Birr (ETB). Not sure what you need? Message us and we will suggest the right package.</p></div>
+<div class="card deal live"><div><div class="eyebrow">Grand Opening • Limited time only</div><h3>Special opening discount on all packages &amp; services</h3><p>Our way of saying thank you. Offer ends November 15, 2026.</p></div><div class="clock"><small>Time left</small><b id="cd">Until Nov 15, 2026</b></div></div>
+<div class="card ended notice"><strong>The Grand Opening offer has ended.</strong> Prices shown are our regular prices. Contact us for current offers.</div>
+
+<h3 class="sub">Website development</h3><p class="subp">Your business, online, professionally.</p>
+<div class="grid4">
+<div class="card pk"><h3>Basic</h3><p class="pg">1–3 pages</p><div class="list"><div>Business info</div><div>Services</div><div>Phone number</div><div>Social media links</div></div><div class="price"><b class="now" data-now="7,200 ETB" data-was="8,000 ETB">7,200 ETB</b><s>8,000 ETB</s><span class="off">10% OFF</span></div></div>
+<div class="card pk"><h3>Business</h3><p class="pg">4–6 pages</p><div class="list"><div>Better design</div><div>Services &amp; gallery</div><div>Contact form</div><div>Google Maps</div><div>Social media integration</div></div><div class="price"><b class="now" data-now="13,500 ETB" data-was="15,000 ETB">13,500 ETB</b><s>15,000 ETB</s><span class="off">10% OFF</span></div></div>
+<div class="card pk cyan"><h3>Premium</h3><p class="pg">6–10 pages</p><div class="list"><div>Elegant custom design</div><div>Portfolio</div><div>Booking / inquiry forms</div><div>Contact integrations</div><div>Basic SEO</div></div><div class="price"><b class="now" data-now="22,000 ETB" data-was="25,000 ETB">22,000 ETB</b><s>25,000 ETB</s><span class="off">12% OFF</span></div></div>
+<div class="card pk hot"><h3>Luxury</h3><div class="list"><div>Premium design</div><div>Advanced layouts</div><div>Appointment booking</div><div>Multiple contact methods</div><div>Telegram bot integration</div><div>Advanced functionality</div></div><div class="price"><b class="now" data-now="36,000 – 49,500 ETB" data-was="40,000 – 55,000 ETB">36,000 – 49,500 ETB</b><s>40,000 – 55,000 ETB</s><span class="off">10% OFF</span></div></div>
+</div>
+
+<h3 class="sub">Telegram bot packages</h3><p class="subp">Automate. Engage. Grow.</p>
+<div class="grid3">
+<div class="card pk"><h3>Basic Bot</h3><div class="list"><div>Welcome messages</div><div>Service menus</div><div>Business info</div><div>Contact buttons</div></div><div class="price"><b class="now" data-now="5,000 ETB" data-was="5,500 ETB">5,000 ETB</b><s>5,500 ETB</s><span class="off">10% OFF</span></div></div>
+<div class="card pk"><h3>Business Bot</h3><div class="list"><div>Customer inquiries</div><div>FAQs</div><div>Booking requests</div><div>Lead collection</div><div>Notifications</div></div><div class="price"><b class="now" data-now="10,000 – 18,000 ETB" data-was="11,000 – 20,000 ETB">10,000 – 18,000 ETB</b><s>11,000 – 20,000 ETB</s><span class="off">10% OFF</span></div></div>
+<div class="card pk cyan"><h3>Advanced Bot</h3><div class="list"><div>Custom workflows</div><div>Database connections</div><div>External integrations</div><div>Payment features (if needed)</div></div><div class="price"><b class="now" data-now="25,000 ETB+" data-was="27,500 ETB+">25,000 ETB+</b><s>27,500 ETB+</s><span class="off">10% OFF</span></div></div>
+</div>
+
+<h3 class="sub">Complete digital transformation</h3><p class="subp">Best value: an all-in-one solution for a stronger, smarter business.</p>
+<div class="card feature"><div><span class="off" style="background:linear-gradient(135deg,#f5da91,#dbae46)">BEST VALUE</span><h3>The complete digital package</h3><div class="list cols2"><div>Luxury website</div><div>Telegram bot (advanced)</div><div>Professional email setup</div><div>Google Maps / Business profile</div><div>Social media setup (FB + IG + Telegram)</div><div>Graphic design (5 posters)</div><div>Video editing (2 short videos)</div><div>Online forms</div><div>Cloud storage organization</div><div>AI tools &amp; guidance</div><div>Contact integration</div><div>Launch support</div></div></div><div class="big-price"><div class="eyebrow" style="margin-bottom:10px">Limited offer</div><b class="now" data-now="54,000 ETB" data-was="60,000 ETB">54,000 ETB</b><s>60,000 ETB</s><a class="btn gold" href="#start" data-page="start">Start this package →</a></div></div>
+
+<h3 class="sub">Business packages</h3><p class="subp">More services. More value.</p>
+<div class="grid3">
+<div class="card pk"><h3>Digital Starter</h3><div class="list"><div>Email setup</div><div>Maps setup</div><div>Facebook + Instagram + Telegram</div><div>3 poster designs</div></div><div class="price"><b class="now" data-now="5,500 ETB" data-was="Contact us for price">5,500 ETB</b><span class="off">10% OFF</span></div></div>
+<div class="card pk"><h3>Business Growth</h3><div class="list"><div>Business website</div><div>Email setup</div><div>Maps setup</div><div>Facebook + Instagram + Telegram</div><div>2 poster designs</div></div><div class="price"><b class="now" data-now="19,000 ETB" data-was="Contact us for price">19,000 ETB</b><span class="off">10% OFF</span></div></div>
+<div class="card pk cyan"><h3>Digital Pro</h3><div class="list"><div>Premium website</div><div>Basic Telegram bot</div><div>Email setup</div><div>Maps setup</div><div>Facebook + Instagram + Telegram</div><div>5 poster designs</div></div><div class="price"><b class="now" data-now="38,000 ETB" data-was="Contact us for price">38,000 ETB</b><span class="off">10% OFF</span></div></div>
+</div>
+<p class="fine">Looking for everything in one? See the Complete Digital Transformation package above (54,000 ETB).</p>
+
+<h3 class="sub">Individual services</h3><p class="subp">Get exactly what you need.</p>
+<div class="card"><div class="rows">
+<div class="row"><span>Email account setup</span><b>700 ETB / account</b></div><div class="row"><span>Google Maps / Business profile</span><b>1,500 – 2,500 ETB</b></div>
+<div class="row"><span>Facebook business page</span><b>800 ETB</b></div><div class="row"><span>Instagram business page</span><b>800 ETB</b></div>
+<div class="row"><span>Telegram business channel</span><b>800 ETB</b></div><div class="row"><span>All 3 social platforms (FB + IG + TG)</span><b>2,000 ETB</b></div>
+<div class="row"><span>Canva poster design</span><b>500 ETB / poster</b></div><div class="row"><span>Video editing (short promotional)</span><b>1,000 – 2,500 ETB</b></div>
+<div class="row"><span>Online form creation</span><b>1,000 ETB</b></div><div class="row"><span>Booking / inquiry form setup</span><b>2,500 ETB</b></div>
+<div class="row"><span>File &amp; cloud storage organization</span><b>1,500 – 3,000 ETB</b></div><div class="row"><span>AI tools setup &amp; guidance</span><b>1,500 – 3,500 ETB</b></div>
+</div></div>
+<div class="notice" style="margin-top:14px">✓ <strong>Small services pay only if satisfied.</strong> This covers email, social media, basic design and similar jobs.</div>
+
+<h3 class="sub">Monthly content packages</h3><p class="subp">Keep your brand active and visible.</p>
+<div class="grid3">
+<div class="card pk"><h3>Content Starter</h3><div class="list"><div>8 designs + captions</div></div><div class="price"><b class="now">4,000 ETB / month</b></div></div>
+<div class="card pk"><h3>Content Growth</h3><div class="list"><div>12 designs</div><div>4 videos</div><div>Content schedule</div></div><div class="price"><b class="now">8,000 ETB / month</b></div></div>
+<div class="card pk cyan"><h3>Custom Plan</h3><div class="list"><div>Tailored to your needs</div></div><div class="price"><b class="now">From 12,000 ETB / month</b></div></div>
+</div>
+
+<div class="card deal" style="margin-top:46px"><div><h3>Let's turn your ideas into real results.</h3><p>Tell us what you need and we will recommend the best package.</p></div><div class="actions" style="margin:0"><a class="btn gold" href="#start" data-page="start">Start a Project →</a><a class="btn blue" href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener">Contact us on Telegram</a></div></div>
+</div></section>
+
+<section class="page" id="work"><div class="container"><div class="head"><div><div class="eyebrow">Our work</div><h2>Built for real businesses.</h2></div><p>We connect websites, contact channels, business profiles and customer-facing systems into one coherent presence.</p></div><div class="grid2"><div class="card"><div class="eyebrow">Featured project</div><h3 style="font-size:28px;margin-top:8px">KUNCHO BARBERSHOP</h3><p>Website concept with services, gallery, booking, location, directions, call and SMS contact.</p><div style="margin-top:15px"><span class="tag">Website</span><span class="tag">Booking</span><span class="tag">Maps</span><span class="tag">Contact</span></div></div><div class="card"><div class="eyebrow">Digital setup</div><h3 style="font-size:28px;margin-top:8px">From offline presence to connected system.</h3><p>We help bring the key pieces together so customers have clear ways to discover and contact a business.</p></div></div></div></section>
+<section class="page" id="process"><div class="container"><div class="head"><div><div class="eyebrow">Process</div><h2>Simple. Clear. Practical.</h2></div><p>Tell us what you need, we build the digital piece, then make it usable.</p></div><div class="grid2"><div class="card"><h3>01 · Understand</h3><p>We learn about the business, services, location and digital goals.</p></div><div class="card"><h3>02 · Plan</h3><p>We define the website, profiles, forms, email and other pieces actually needed.</p></div><div class="card"><h3>03 · Build</h3><p>We create and connect the requested digital assets.</p></div><div class="card"><h3>04 · Review</h3><p>You review the work, adjustments are made, and the system is ready to use.</p></div></div></div></section>
+<section class="page" id="about"><div class="container"><div class="head"><div><div class="eyebrow">About</div><h2>Helping businesses grow.</h2></div><p>LZ Digital focuses on practical digital setup for businesses that want a cleaner, more useful online presence.</p></div><div class="grid2"><div class="card"><h3>Our approach</h3><div class="list"><div>Useful before flashy</div><div>Clear communication</div><div>Business-first thinking</div><div>Flexible digital solutions</div></div></div><div class="card"><h3>Our contact channels</h3><div class="contact"><div class="contact-item"><div class="i">✈️</div><div><strong>Telegram</strong><div>@LZDigitalAgency</div><a class="btn ghost" href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener">Open Telegram</a></div></div><div class="contact-item"><div class="i">✉️</div><div><strong>Email</strong><div>lzdigital20@gmail.com</div><a class="btn ghost" href="mailto:lzdigital20@gmail.com">Email LZ Digital</a></div></div><div class="contact-item"><div class="i">☎️</div><div><strong>Primary</strong><div>+251957134860</div><a class="btn ghost" href="tel:+251957134860">Call</a></div></div><div class="contact-item"><div class="i">☎️</div><div><strong>Secondary</strong><div>+251948696673</div><a class="btn ghost" href="tel:+251948696673">Call</a></div></div></div></div></div></div></section>
+<section class="page" id="faq"><div class="container"><div class="head"><div><div class="eyebrow">FAQ</div><h2>Questions, answered.</h2></div><p>Useful information before starting a project.</p></div><div class="faq"><details open><summary>What can LZ Digital build?</summary><p>Websites, Telegram bots, business profiles, professional email, social pages, online forms, digital organization, simple promotional graphics and practical AI workflows.</p></details><details><summary>Can you build a website for a client?</summary><p>Yes. LZ Digital can create business websites with service information, galleries, contact buttons, forms, locations and requested features.</p></details><details><summary>Can you help with Google Maps?</summary><p>Yes. LZ Digital can help with business location and profile setup. Google may require verification or review.</p></details><details><summary>How much does it cost?</summary><p>Prices are listed in ETB on the <a href="#pricing" data-page="pricing" style="color:#f0d68e">Pricing page</a>, from single services to full packages. Message us if you are unsure which one fits.</p></details><details><summary>What is the Grand Opening discount?</summary><p>Until November 15, 2026, our packages and services carry a special opening discount, shown next to each price on the Pricing page.</p></details><details><summary>Do I pay if I am not satisfied?</summary><p>For small services such as email setup, social media pages and basic design, you pay only if you are satisfied.</p></details><details><summary>How do I start?</summary><p>Use Start a Project, send an email, message Telegram, or call either phone number.</p></details></div></div></section>
+<section class="page" id="contact"><div class="container"><div class="head"><div><div class="eyebrow">Contact</div><h2>Choose your channel.</h2></div><p>Use whichever contact method is easiest.</p></div><div class="grid2"><div class="card"><div class="contact"><div class="contact-item"><div class="i">✈️</div><div><strong>Telegram</strong><div>@LZDigitalAgency</div><a class="btn blue" href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener">Message on Telegram</a></div></div><div class="contact-item"><div class="i">✉️</div><div><strong>Email</strong><div>lzdigital20@gmail.com</div><a class="btn gold" href="mailto:lzdigital20@gmail.com?subject=LZ%20Digital%20Inquiry">Send Email</a></div></div><div class="contact-item"><div class="i">☎️</div><div><strong>Primary phone</strong><div>+251957134860</div><div class="actions"><a class="btn ghost" href="tel:+251957134860">Call</a><a class="btn ghost" href="sms:+251957134860">SMS</a></div></div></div><div class="contact-item"><div class="i">☎️</div><div><strong>Secondary phone</strong><div>+251948696673</div><div class="actions"><a class="btn ghost" href="tel:+251948696673">Call</a><a class="btn ghost" href="sms:+251948696673">SMS</a></div></div></div></div></div><div class="card"><div class="eyebrow">Quick inquiry</div><h3 style="font-size:28px;margin-top:8px">Tell us what you need.</h3><form class="form" id="contactForm"><div class="field"><label>Name</label><input id="cName" required></div><div class="field"><label>Business</label><input id="cBiz"></div><div class="field"><label>Your contact</label><input id="cContact" required></div><div class="field"><label>Request</label><textarea id="cMsg" rows="5" required></textarea></div><button class="btn gold">Prepare Email →</button><div class="result" id="cResult"></div></form></div></div></div></section>
+<section class="page" id="start"><div class="container"><div class="head"><div><div class="eyebrow">Start a project</div><h2>Tell us what you want built.</h2></div><p>Send a structured project request to LZ Digital.</p></div><div class="grid2"><div class="card"><form class="form" id="projectForm"><div class="field"><label>Name *</label><input id="pName" required></div><div class="field"><label>Business name *</label><input id="pBiz" required></div><div class="field"><label>Phone / Telegram *</label><input id="pPhone" required></div><div class="field"><label>Email</label><input id="pEmail" type="email"></div><div class="field"><label>Main service</label><select id="pService"><option>Website</option><option>Telegram Bot</option><option>Google Maps / Business Presence</option><option>Professional Business Email</option><option>Social / Telegram Setup</option><option>Forms / Booking</option><option>Canva / Promotional Design</option><option>Video / Monthly Content</option><option>Digital Organization</option><option>AI Tools / Workflow</option><option>Full Digital Setup</option></select></div><div class="field"><label>Package (optional)</label><select id="pPackage"><option>Not sure yet</option><option>Website: Basic</option><option>Website: Business</option><option>Website: Premium</option><option>Website: Luxury</option><option>Telegram Bot: Basic</option><option>Telegram Bot: Business</option><option>Telegram Bot: Advanced</option><option>Business Package: Digital Starter</option><option>Business Package: Business Growth</option><option>Business Package: Digital Pro</option><option>Complete Digital Transformation</option><option>Monthly Content: Starter</option><option>Monthly Content: Growth</option><option>Monthly Content: Custom</option></select></div><div class="field"><label>Details *</label><textarea id="pDetails" rows="7" required></textarea></div><button class="btn gold">Create Inquiry Email →</button><div class="result" id="pResult"></div></form></div><div class="card"><div class="eyebrow">Direct contact</div><h3 style="font-size:28px">Prefer talking directly?</h3><p>Use Telegram, email or either phone number.</p><div class="actions"><a class="btn blue" href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener">✈ Telegram</a><a class="btn gold" href="mailto:lzdigital20@gmail.com">✉ Email</a><a class="btn ghost" href="tel:+251957134860">☎ +251957134860</a><a class="btn ghost" href="tel:+251948696673">☎ +251948696673</a></div><div class="notice" style="margin-top:20px">LZ Digital — <strong>Helping businesses grow.</strong></div></div></div></div></section>
+</main>
+<footer><div class="container foot"><div><strong style="color:#efd78d">LZ DIGITAL</strong><div>Helping businesses grow.</div></div><div>Telegram @LZDigitalAgency · lzdigital20@gmail.com</div><div>© <span id="year"></span> LZ Digital</div></div></footer>
+<div class="float"><a href="https://t.me/LZDigitalAgency" target="_blank" rel="noopener" title="Telegram">✈</a><a href="mailto:lzdigital20@gmail.com" title="Email">✉</a><a href="tel:+251957134860" title="Primary phone">☎</a></div>
+<script>
+const pages=[...document.querySelectorAll('.page')],links=[...document.querySelectorAll('[data-page]')],nav=document.getElementById('links'),hero=document.getElementById('hero');function show(n,push=true){const t=document.getElementById(n)?n:'home';pages.forEach(x=>x.classList.toggle('active',x.id===t));links.forEach(x=>x.classList.toggle('active',x.dataset.page===t));hero.style.display=t==='home'?'grid':'none';nav.classList.remove('open');window.scrollTo({top:0,behavior:'smooth'});if(push&&location.hash!=='#'+t)history.pushState(null,'','#'+t)}links.forEach(a=>a.addEventListener('click',e=>{e.preventDefault();show(a.dataset.page)}));document.getElementById('menu').onclick=()=>nav.classList.toggle('open');window.addEventListener('load',()=>show(location.hash.slice(1)||'home',false));window.addEventListener('popstate',()=>show(location.hash.slice(1)||'home',false));document.getElementById('year').textContent=new Date().getFullYear();
+/* Scroll-reveal: cards fade and rise as they enter the screen */
+(function(){if(!('IntersectionObserver' in window)||matchMedia('(prefers-reduced-motion:reduce)').matches)return;const io=new IntersectionObserver(es=>es.forEach(en=>{if(!en.isIntersecting)return;const el=en.target;io.unobserve(el);requestAnimationFrame(()=>el.classList.add('in'));setTimeout(()=>el.classList.remove('rv','in'),1400)}),{threshold:.1});document.querySelectorAll('.card,.sub,.subp,.row,.faq details,.head').forEach(el=>{const i=[...el.parentElement.children].indexOf(el);el.style.setProperty('--d',Math.min(i,6)*90+'ms');el.classList.add('rv');io.observe(el)})})();
+/* Grand Opening offer: ends end of day Nov 15, 2026 (Ethiopia time). After that, regular prices show automatically. */
+const OFFER_END=new Date('2026-11-15T23:59:59+03:00');function tick(){const ms=OFFER_END-Date.now(),on=ms>0;document.body.classList.toggle('offer-off',!on);document.querySelectorAll('.now[data-was]').forEach(e=>{e.textContent=on?e.dataset.now:e.dataset.was});const c=document.getElementById('cd');if(c&&on){const d=Math.floor(ms/864e5),h=Math.floor(ms%864e5/36e5),m=Math.floor(ms%36e5/6e4);c.textContent=d+'d '+h+'h '+m+'m'}}tick();setInterval(tick,30000);
+function mail(subject,body){var mailtoUrl='mailto:lzdigital20@gmail.com?subject='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);var gmailUrl='https://mail.google.com/mail/?view=cm&fs=1&to=lzdigital20@gmail.com&su='+encodeURIComponent(subject)+'&body='+encodeURIComponent(body);var isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);if(isMobile){location.href=mailtoUrl}else{window.open(gmailUrl,'_blank','noopener')}return{mailtoUrl:mailtoUrl,gmailUrl:gmailUrl,isMobile:isMobile}}document.getElementById('contactForm').addEventListener('submit',e=>{e.preventDefault();const r=mail('LZ Digital Inquiry',`Name: ${cName.value}
+Business: ${cBiz.value||'Not provided'}
+Contact: ${cContact.value}
+
+Request:
+${cMsg.value}`);cResult.style.display='block';cResult.innerHTML=r.isMobile?'<strong>Opening your email app.</strong> If nothing opened, <a href="'+r.gmailUrl+'" target="_blank" rel="noopener">tap here for Gmail</a>.':'<strong>Opening Gmail in a new tab.</strong> Prefer your own email app? <a href="'+r.mailtoUrl+'">Click here instead</a>.'});document.getElementById('projectForm').addEventListener('submit',e=>{e.preventDefault();const r=mail('New LZ Digital Project Inquiry',`Name: ${pName.value}
+Business: ${pBiz.value}
+Phone / Telegram: ${pPhone.value}
+Email: ${pEmail.value||'Not provided'}
+Service: ${pService.value}
+Package: ${pPackage.value}
+
+Details:
+${pDetails.value}`);pResult.style.display='block';pResult.innerHTML=r.isMobile?'<strong>Opening your email app.</strong> If nothing opened, <a href="'+r.gmailUrl+'" target="_blank" rel="noopener">tap here for Gmail</a>.':'<strong>Opening Gmail in a new tab.</strong> Prefer your own email app? <a href="'+r.mailtoUrl+'">Click here instead</a>.'});
+</script></body></html>
